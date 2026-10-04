@@ -1,8 +1,8 @@
 # nats-auth-callout
 
 NATS auth callout for the homelab cluster. Pods authenticate with a projected
-ServiceAccount token; admins authenticate with their Omni OIDC token. Nothing is
-stored: every key is derived from one secret.
+ServiceAccount token; admins authenticate with a Pocket ID token. Keys are derived from two
+secrets, and the only state is a KV bucket mapping each ServiceAccount to its account.
 
 ```mermaid
 sequenceDiagram
@@ -10,17 +10,18 @@ sequenceDiagram
     participant N as NATS server
     participant A as nats-auth-callout
     participant K as kube-apiserver
-    participant O as Omni OIDC keys
+    participant P as Pocket ID keys
 
     C->>N: CONNECT token=<JWT>
     N->>A: auth request (AUTH account, encrypted)
-    alt iss == omni.cullen.rocks/oidc
-        A->>O: verify signature (JWKS)
-        A-->>N: user JWT in SYS, expires with the token<br/>(needs cluster=prod, group system:masters)
+    alt iss == id.cullen.rocks
+        A->>P: verify signature (JWKS)
+        A-->>N: user JWT in SYS, expires with the token<br/>(needs group nats-admins)
     else projected SA token (aud=nats)
         A->>K: TokenReview
         K-->>A: system:serviceaccount:<ns>:<sa>
-        A->>N: $SYS.REQ.CLAIMS.UPDATE (create/refresh account <ns>/<sa>)
+        A->>N: KV accounts: look up or create <ns>/<sa>
+        A->>N: $SYS.REQ.CLAIMS.UPDATE (account JWT, once per process)
         A-->>N: user JWT in account <ns>/<sa>
     end
     N-->>C: connected
@@ -28,24 +29,51 @@ sequenceDiagram
 
 - Each `namespace/serviceaccount` gets its own NATS account, created on first connect and
   pushed to the server's full resolver. The `default` ServiceAccount is rejected.
+- An account's identity key is random and discarded at once. Its public key is kept in the
+  `accounts` KV bucket in the AUTH account, on the same JetStream storage as the data it owns.
+  If NATS data is lost, both go together and workloads get fresh, empty accounts.
+
+## Keys
+
+| Secret | Derives | Where it lives |
+|---|---|---|
+| `NATS_OPERATOR_SECRET` | identities of the operator, SYS and AUTH | 1Password `nats-auth-callout operator` (vault Private), used only by `init`; never in the cluster |
+| `NATS_AUTH_MASTER` | every signing key, the xkey, the callout's own users | 1Password `nats-auth-callout` (vault k8s-secrets) → ExternalSecret |
+
+Users are signed with account signing keys and accounts with the operator signing key, so rotating
+`NATS_AUTH_MASTER` re-signs everything but changes no identity: JetStream data is kept.
 - Per-account caps: 50 connections, 1000 subscriptions, 1 MiB payload, no leafnodes,
   JetStream 1 GiB disk / 10 streams / 100 consumers. NATS has no msgs/sec throttle; these are caps.
 
 ## Bootstrap
 
 ```bash
-# 1. the one secret (1Password -> ExternalSecret -> NATS_AUTH_MASTER)
-op item create --vault k8s-secrets --category login --title nats-auth-callout
-op item edit nats-auth-callout --vault k8s-secrets --generate-password='letters,digits,64'
+# 1. the two secrets
+op item create --vault Private --category password --title 'nats-auth-callout operator' \
+  --generate-password='letters,digits,64'
+op item create --vault k8s-secrets --category login --title nats-auth-callout \
+  --generate-password='letters,digits,64'
 
-# 2. print the server config (operator, SYS/AUTH accounts, sentinel)
-NATS_AUTH_MASTER="$(op item get nats-auth-callout --vault k8s-secrets --fields password --reveal)" \
+# 2. print the server config and the callout's env
+NATS_OPERATOR_SECRET="$(op read 'op://Private/nats-auth-callout operator/password')" \
+NATS_AUTH_MASTER="$(op read op://k8s-secrets/nats-auth-callout/password)" \
   go run . init
 ```
 
-3. Merge the printed JSON into the homelab repo's `k8s/nats/values.yaml` under `config.merge`.
+3. In the homelab repo, merge `.config` into `k8s/nats/values.yaml` under `config.merge`, and set
+   `.env` (`NATS_SYS_ACCOUNT`, `NATS_AUTH_ACCOUNT`, both public keys) on the callout Deployment.
+4. In Pocket ID, create a public OIDC client with client ID `nats` and device code enabled, and a
+   `nats-admins` group with your user in it.
 
-The service reads `NATS_AUTH_MASTER` (required) and `NATS_URL` (default `nats://nats.nats:4222`).
+The service reads `NATS_AUTH_MASTER`, `NATS_SYS_ACCOUNT`, `NATS_AUTH_ACCOUNT` (all required) and
+`NATS_URL` (default `nats://nats.nats:4222`).
+
+### Rotating `NATS_AUTH_MASTER`
+
+Generate a new password in the `nats-auth-callout` item, rerun `init`, and roll out the new
+`.config` (bump the pod annotation in `values.yaml`, since the operator can't be hot-reloaded)
+together with the callout. Logins fail until both are on the new keys. Existing connections drop
+and reconnect. Each account is re-signed the first time it is used after the restart.
 
 ## Develop and build
 
@@ -102,26 +130,27 @@ nc, err := nats.Connect("nats://nats.nats:4222",
 ## Admin usage
 
 ```bash
-TOKEN=$(kubectl oidc-login get-token \
-  --oidc-issuer-url=https://omni.cullen.rocks/oidc \
-  --oidc-client-id=native --oidc-extra-scope=cluster:prod | jq -r .status.token)
+TOKEN=$(kubectl oidc-login get-token --grant-type=device-code \
+  --oidc-issuer-url=https://id.cullen.rocks --oidc-client-id=nats \
+  --oidc-extra-scope=groups | jq -r .status.token)
 nats --server wss://nats.cullen.rocks --token "$TOKEN" server list
 ```
 
-Requires `cluster=prod` and `system:masters` in the token. You land in the SYS account and the
-session expires with the token.
+Requires the `nats-admins` group. You land in the SYS account and the session expires with the
+token. The token is only valid for NATS (`aud=nats`), not for anything else Pocket ID protects.
 
 ## Known ceilings
 
-- One master secret is the whole trust root. Rotating it re-keys every account and orphans their
-  JetStream data.
+- `NATS_AUTH_MASTER` can sign for any account until it is rotated. Rotation is a short outage,
+  not a seamless handover (the operator lists only one signing key at a time).
+- Losing `NATS_OPERATOR_SECRET` means rebuilding the trust root, which orphans all JetStream data.
 - A deleted pod stays connected until its token expires (at most `expirationSeconds`).
-- The Omni token is a live cluster-admin credential. It crosses the in-cluster websocket leg in
-  plaintext after Traefik terminates TLS.
+- The admin token crosses the in-cluster websocket leg in plaintext after Traefik terminates TLS.
 - Cross-account sharing (exports/imports) is not implemented.
 - No rate limit on JWKS refetches for unknown `kid`s; bounded only by the 8 workers and the 1.5s
   per-request budget.
 - Accounts are never garbage-collected, and any ServiceAccount in any namespace gets one (no
   namespace allowlist; fine for a single-owner cluster).
 - The JetStream per-account disk limit is soft in clustered mode.
-- If the resolver data is wiped, the callout re-pushes accounts only after it restarts.
+- If the resolver data is wiped but JetStream's isn't, the callout re-pushes accounts only after it
+  restarts.

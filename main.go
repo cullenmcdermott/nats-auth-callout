@@ -2,10 +2,9 @@
 //
 // Pods connect with a projected ServiceAccount token (audience "nats") and are
 // placed in a NATS account per namespace/serviceaccount, created on first use.
-// Omni OIDC tokens carrying system:masters for the prod cluster are placed in
-// the system account.
+// Pocket ID tokens carrying the nats-admins group are placed in the system account.
 //
-//	nats-auth-callout init   print the server config (JSON) derived from NATS_AUTH_MASTER
+//	nats-auth-callout init   print the server config and callout env (JSON)
 //	nats-auth-callout        run the callout service
 package main
 
@@ -33,23 +32,26 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/nats-io/nkeys"
 	"github.com/synadia-io/callout.go"
 )
 
 const (
-	omniIssuer  = "https://omni.cullen.rocks/oidc"
-	omniClient  = "native"
-	omniCluster = "prod"
-	adminGroup  = "system:masters"
+	adminIssuer = "https://id.cullen.rocks"
+	adminClient = "nats"
+	adminGroup  = "nats-admins"
 	audience    = "nats"
 	saDir       = "/var/run/secrets/kubernetes.io/serviceaccount/"
 	budget      = 1500 * time.Millisecond // per-request, under the server's 2s auth timeout
+	bucket      = "accounts"              // KV in the AUTH account: namespace/serviceaccount -> account public key
 )
 
-// keys derives every nkey from one master secret so replicas agree and nothing is stored.
-// ponytail: one secret is the whole trust root; rotating it re-keys every account and orphans
-// their JetStream data. Split out an operator signing key if rotation ever matters.
+// keys derives nkeys from a secret so replicas agree and nothing is stored. There are two secrets:
+//   - NATS_OPERATOR_SECRET: the identities of the operator, SYS and AUTH. Only `init` needs it, so it
+//     stays in 1Password and never reaches the cluster.
+//   - NATS_AUTH_MASTER: every signing key. Rotating it re-signs accounts but keeps their identities,
+//     so no JetStream data is orphaned.
 type keys []byte
 
 func (k keys) derive(prefix nkeys.PrefixByte, label string) nkeys.KeyPair {
@@ -69,15 +71,23 @@ func (k keys) derive(prefix nkeys.PrefixByte, label string) nkeys.KeyPair {
 	return kp
 }
 
+// Identities, from NATS_OPERATOR_SECRET.
 func (k keys) operator() nkeys.KeyPair { return k.derive(nkeys.PrefixByteOperator, "operator") }
 func (k keys) sys() nkeys.KeyPair      { return k.derive(nkeys.PrefixByteAccount, "sys") }
 func (k keys) auth() nkeys.KeyPair     { return k.derive(nkeys.PrefixByteAccount, "auth") }
-func (k keys) xkey() nkeys.KeyPair     { return k.derive(nkeys.PrefixByteCurve, "xkey") }
+
+// Signing keys, from NATS_AUTH_MASTER.
+func (k keys) operatorSigner() nkeys.KeyPair {
+	return k.derive(nkeys.PrefixByteOperator, "operator-signing")
+}
+func (k keys) sysSigner() nkeys.KeyPair  { return k.derive(nkeys.PrefixByteAccount, "sys-signing") }
+func (k keys) authSigner() nkeys.KeyPair { return k.derive(nkeys.PrefixByteAccount, "auth-signing") }
+func (k keys) xkey() nkeys.KeyPair       { return k.derive(nkeys.PrefixByteCurve, "xkey") }
 func (k keys) user(name string) nkeys.KeyPair {
 	return k.derive(nkeys.PrefixByteUser, "user:"+name)
 }
-func (k keys) account(name string) nkeys.KeyPair {
-	return k.derive(nkeys.PrefixByteAccount, "account:"+name)
+func (k keys) accountSigner(acct string) nkeys.KeyPair {
+	return k.derive(nkeys.PrefixByteAccount, "account-signing:"+acct)
 }
 
 func pub(kp nkeys.KeyPair) string {
@@ -90,49 +100,54 @@ func pub(kp nkeys.KeyPair) string {
 
 // serverConfig returns the nats.conf fragment that trusts these keys. JSON is valid in both
 // nats.conf and Helm values.
-func serverConfig(k keys) (map[string]any, error) {
-	op := k.operator()
+func serverConfig(o, m keys) (map[string]any, error) {
+	op := o.operator()
 	oc := jwt.NewOperatorClaims(pub(op))
 	oc.Name = "homelab"
-	oc.SystemAccount = pub(k.sys())
+	oc.SystemAccount = pub(o.sys())
+	oc.SigningKeys.Add(pub(m.operatorSigner()))
 	opJWT, err := oc.Encode(op)
 	if err != nil {
 		return nil, err
 	}
 
-	sc := jwt.NewAccountClaims(pub(k.sys()))
+	sc := jwt.NewAccountClaims(pub(o.sys()))
 	sc.Name = "SYS"
-	sysJWT, err := sc.Encode(op)
+	sc.SigningKeys.Add(pub(m.sysSigner()))
+	sysJWT, err := sc.Encode(m.operatorSigner())
 	if err != nil {
 		return nil, err
 	}
 
-	ac := jwt.NewAccountClaims(pub(k.auth()))
+	ac := jwt.NewAccountClaims(pub(o.auth()))
 	ac.Name = "AUTH"
+	ac.SigningKeys.Add(pub(m.authSigner()))
 	ac.Authorization = jwt.ExternalAuthorization{
-		AuthUsers:       jwt.StringList{pub(k.user("callout"))},
+		AuthUsers:       jwt.StringList{pub(m.user("callout"))},
 		AllowedAccounts: jwt.StringList{jwt.AnyAccount},
-		XKey:            pub(k.xkey()),
+		XKey:            pub(m.xkey()),
 	}
-	authJWT, err := ac.Encode(op)
+	ac.Limits.JetStreamLimits = jwt.JetStreamLimits{DiskStorage: 64 << 20, Streams: -1, Consumer: -1} // the accounts bucket
+	authJWT, err := ac.Encode(m.operatorSigner())
 	if err != nil {
 		return nil, err
 	}
 
 	// Token-only clients present this bearer JWT, which lands them in AUTH and triggers the callout.
-	uc := jwt.NewUserClaims(pub(k.user("sentinel")))
+	uc := jwt.NewUserClaims(pub(m.user("sentinel")))
+	uc.IssuerAccount = pub(o.auth())
 	uc.BearerToken = true
 	uc.Pub.Deny.Add(">")
 	uc.Sub.Deny.Add(">")
-	sentinel, err := uc.Encode(k.auth())
+	sentinel, err := uc.Encode(m.authSigner())
 	if err != nil {
 		return nil, err
 	}
 
 	return map[string]any{
 		"operator":         opJWT,
-		"system_account":   pub(k.sys()),
-		"resolver_preload": map[string]string{pub(k.sys()): sysJWT, pub(k.auth()): authJWT},
+		"system_account":   pub(o.sys()),
+		"resolver_preload": map[string]string{pub(o.sys()): sysJWT, pub(o.auth()): authJWT},
 		"default_sentinel": sentinel,
 	}, nil
 }
@@ -142,11 +157,14 @@ type service struct {
 	kube      *http.Client
 	kubeAPI   string
 	kubeToken string // path to our own SA token, re-read per request since kubelet rotates it
+	replicas  int    // of the accounts bucket
 
-	k      keys
-	sys    *nats.Conn
-	mu     sync.Mutex
-	pushed map[string]bool
+	m                 keys
+	sysAcct, authAcct string
+	sys               *nats.Conn
+	kv                jetstream.KeyValue
+	mu                sync.Mutex
+	pushed            map[string]bool // account public keys pushed by this process
 }
 
 func (s *service) authorize(req *jwt.AuthorizationRequest) (string, error) {
@@ -158,7 +176,7 @@ func (s *service) authorize(req *jwt.AuthorizationRequest) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	iss, exp := peek(tok)
-	if iss == omniIssuer {
+	if iss == adminIssuer {
 		return s.authorizeAdmin(ctx, req.UserNkey, tok)
 	}
 	return s.authorizeWorkload(ctx, req.UserNkey, tok, exp)
@@ -189,19 +207,19 @@ func (s *service) authorizeAdmin(ctx context.Context, userNkey, tok string) (str
 		return "", err
 	}
 	var c struct {
-		Cluster string   `json:"cluster"`
-		Groups  []string `json:"groups"`
+		Groups []string `json:"groups"`
 	}
 	if err := idt.Claims(&c); err != nil {
 		return "", err
 	}
-	if c.Cluster != omniCluster || !slices.Contains(c.Groups, adminGroup) {
-		return "", fmt.Errorf("%s: not %s on %s", idt.Subject, adminGroup, omniCluster)
+	if !slices.Contains(c.Groups, adminGroup) {
+		return "", fmt.Errorf("%s: not in %s", idt.Subject, adminGroup)
 	}
 	uc := jwt.NewUserClaims(userNkey)
 	uc.Name = idt.Subject
 	uc.Expires = idt.Expiry.Unix()
-	return uc.Encode(s.k.sys())
+	uc.IssuerAccount = s.sysAcct
+	return uc.Encode(s.m.sysSigner())
 }
 
 func (s *service) authorizeWorkload(ctx context.Context, userNkey, tok string, exp int64) (string, error) {
@@ -222,15 +240,15 @@ func (s *service) authorizeWorkload(ctx context.Context, userNkey, tok string, e
 	if exp == 0 {
 		return "", fmt.Errorf("%s: token has no exp", user)
 	}
-	name := parts[2] + "/" + parts[3]
-	akp := s.k.account(name)
-	if err := s.ensureAccount(name, akp); err != nil {
+	acct, err := s.account(ctx, parts[2]+"/"+parts[3])
+	if err != nil {
 		return "", err
 	}
 	uc := jwt.NewUserClaims(userNkey)
 	uc.Name = pod
 	uc.Expires = exp // dropped at token expiry; clients reconnect with the rotated token
-	return uc.Encode(akp)
+	uc.IssuerAccount = acct
+	return uc.Encode(s.m.accountSigner(acct))
 }
 
 // tokenReview asks the API server to validate a projected token. Unlike local JWKS checks this
@@ -282,27 +300,54 @@ func (s *service) tokenReview(ctx context.Context, tok string) (user, pod string
 	return out.Status.User.Username, pod, out.Status.User.Groups, nil
 }
 
-// ensureAccount pushes the account JWT to the resolver once per process. Pushing is
-// idempotent, so a restart or the other replica re-pushing is harmless.
-func (s *service) ensureAccount(name string, akp nkeys.KeyPair) error {
+// account returns the account for name, creating it on first use. Its identity key is random and
+// discarded at once: only the public key is kept, in a KV bucket on the same JetStream storage as
+// the data it owns, so the two are lost together or not at all.
+func (s *service) account(ctx context.Context, name string) (string, error) {
+	e, err := s.kv.Get(ctx, name)
+	if errors.Is(err, jetstream.ErrKeyNotFound) {
+		kp, err := nkeys.CreateAccount()
+		if err != nil {
+			return "", err
+		}
+		acct := pub(kp)
+		if _, err = s.kv.Create(ctx, name, []byte(acct)); err == nil {
+			return acct, s.push(ctx, name, acct)
+		} else if !errors.Is(err, jetstream.ErrKeyExists) {
+			return "", fmt.Errorf("account %s: %w", name, err)
+		}
+		e, err = s.kv.Get(ctx, name) // the other replica created it first
+	}
+	if err != nil {
+		return "", fmt.Errorf("account %s: %w", name, err)
+	}
+	acct := string(e.Value())
+	return acct, s.push(ctx, name, acct)
+}
+
+// push sends the account JWT, signed with the current keys, to the resolver once per process.
+// Pushing is idempotent, so the other replica re-pushing is harmless, and a restart after
+// rotating NATS_AUTH_MASTER re-signs every account as it is next used.
+func (s *service) push(ctx context.Context, name, acct string) error {
 	s.mu.Lock()
-	done := s.pushed[name]
+	done := s.pushed[acct]
 	s.mu.Unlock()
 	if done {
 		return nil
 	}
-	ac := jwt.NewAccountClaims(pub(akp))
+	ac := jwt.NewAccountClaims(acct)
 	ac.Name = name
+	ac.SigningKeys.Add(pub(s.m.accountSigner(acct)))
 	ac.Limits.Conn = 50
 	ac.Limits.Subs = 1000
 	ac.Limits.Payload = 1 << 20
 	ac.Limits.LeafNodeConn = 0
 	ac.Limits.JetStreamLimits = jwt.JetStreamLimits{DiskStorage: 1 << 30, Streams: 10, Consumer: 100}
-	token, err := ac.Encode(s.k.operator())
+	token, err := ac.Encode(s.m.operatorSigner())
 	if err != nil {
 		return err
 	}
-	msg, err := s.sys.Request("$SYS.REQ.CLAIMS.UPDATE", []byte(token), 2*time.Second)
+	msg, err := s.sys.RequestWithContext(ctx, "$SYS.REQ.CLAIMS.UPDATE", []byte(token))
 	if err != nil {
 		return fmt.Errorf("push account %s: %w", name, err)
 	}
@@ -317,16 +362,17 @@ func (s *service) ensureAccount(name string, akp nkeys.KeyPair) error {
 		return fmt.Errorf("push account %s: %s", name, msg.Data)
 	}
 	s.mu.Lock()
-	s.pushed[name] = true
+	s.pushed[acct] = true
 	s.mu.Unlock()
 	return nil
 }
 
-// connect logs in as a user minted on the fly from an account key.
-func connect(url, name string, acct, user nkeys.KeyPair) (*nats.Conn, error) {
+// connect logs in as a user minted on the fly with an account signing key.
+func connect(url, name, acct string, signer, user nkeys.KeyPair) (*nats.Conn, error) {
 	uc := jwt.NewUserClaims(pub(user))
 	uc.Name = name
-	token, err := uc.Encode(acct)
+	uc.IssuerAccount = acct
+	token, err := uc.Encode(signer)
 	if err != nil {
 		return nil, err
 	}
@@ -335,47 +381,73 @@ func connect(url, name string, acct, user nkeys.KeyPair) (*nats.Conn, error) {
 }
 
 // start connects s to NATS and serves auth requests until the returned stop is called.
-func start(k keys, url string, s *service) (func(), error) {
-	sys, err := connect(url, "nats-auth-callout-sys", k.sys(), k.user("sys"))
+func start(url string, s *service) (func(), error) {
+	sys, err := connect(url, "nats-auth-callout-sys", s.sysAcct, s.m.sysSigner(), s.m.user("sys"))
 	if err != nil {
 		return nil, fmt.Errorf("sys connect: %w", err)
 	}
-	nc, err := connect(url, "nats-auth-callout", k.auth(), k.user("callout"))
+	nc, err := connect(url, "nats-auth-callout", s.authAcct, s.m.authSigner(), s.m.user("callout"))
 	if err != nil {
 		sys.Close()
 		return nil, fmt.Errorf("callout connect: %w", err)
 	}
-	s.k, s.sys, s.pushed = k, sys, map[string]bool{}
+	stop := func() { nc.Close(); sys.Close() }
+	js, err := jetstream.New(nc)
+	if err != nil {
+		stop()
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s.kv, err = js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: bucket, Replicas: s.replicas})
+	if err != nil {
+		stop()
+		return nil, fmt.Errorf("accounts bucket: %w", err)
+	}
+	s.sys, s.pushed = sys, map[string]bool{}
 	svc, err := callout.NewAuthorizationService(nc,
 		callout.Authorizer(s.authorize),
 		callout.AsyncWorkers(8), // else one slow request stalls every login; a full queue drops (fails closed)
-		callout.ResponseSignerKey(k.auth()),
-		callout.EncryptionKey(k.xkey()),
+		callout.ResponseSignerKey(s.m.authSigner()),
+		callout.ResponseSignerIssuer(s.authAcct),
+		callout.EncryptionKey(s.m.xkey()),
 		callout.ErrCallback(func(err error) { log.Printf("rejected: %v", err) }),
 	)
 	if err != nil {
-		nc.Close()
-		sys.Close()
+		stop()
 		return nil, err
 	}
-	return func() { _ = svc.Stop(); nc.Close(); sys.Close() }, nil
+	return func() { _ = svc.Stop(); stop() }, nil
+}
+
+func secret(name string) keys {
+	v := os.Getenv(name)
+	if len(v) < 32 {
+		log.Fatalf("%s (at least 32 bytes) is required", name)
+	}
+	return keys(v)
 }
 
 func main() {
-	master := os.Getenv("NATS_AUTH_MASTER")
-	if len(master) < 32 {
-		log.Fatal("NATS_AUTH_MASTER (at least 32 bytes) is required")
-	}
-	k := keys(master)
+	m := secret("NATS_AUTH_MASTER")
 
 	if len(os.Args) > 1 && os.Args[1] == "init" {
-		cfg, err := serverConfig(k)
+		o := secret("NATS_OPERATOR_SECRET")
+		cfg, err := serverConfig(o, m)
 		if err != nil {
 			log.Fatal(err)
 		}
-		out, _ := json.MarshalIndent(cfg, "", "  ")
+		out, _ := json.MarshalIndent(map[string]any{
+			"config": cfg,
+			"env":    map[string]string{"NATS_SYS_ACCOUNT": pub(o.sys()), "NATS_AUTH_ACCOUNT": pub(o.auth())},
+		}, "", "  ")
 		fmt.Println(string(out))
 		return
+	}
+
+	sysAcct, authAcct := os.Getenv("NATS_SYS_ACCOUNT"), os.Getenv("NATS_AUTH_ACCOUNT")
+	if sysAcct == "" || authAcct == "" {
+		log.Fatal("NATS_SYS_ACCOUNT and NATS_AUTH_ACCOUNT are required (from `init`)")
 	}
 
 	ca, err := os.ReadFile(saDir + "ca.crt")
@@ -387,14 +459,17 @@ func main() {
 	kube := &http.Client{Timeout: budget, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}}
 
 	ctx := oidc.ClientContext(context.Background(), &http.Client{Timeout: budget})
-	// Remote key set rather than discovery, so Omni being down only blocks admin logins, not startup.
-	admin := oidc.NewVerifier(omniIssuer, oidc.NewRemoteKeySet(ctx, omniIssuer+"/keys"), &oidc.Config{ClientID: omniClient})
+	// Remote key set rather than discovery, so Pocket ID being down only blocks admin logins, not startup.
+	admin := oidc.NewVerifier(adminIssuer, oidc.NewRemoteKeySet(ctx, adminIssuer+"/.well-known/jwks.json"), &oidc.Config{ClientID: adminClient})
 
 	url := os.Getenv("NATS_URL")
 	if url == "" {
 		url = "nats://nats.nats:4222"
 	}
-	stop, err := start(k, url, &service{admin: admin, kube: kube, kubeAPI: "https://kubernetes.default.svc", kubeToken: saDir + "token"})
+	stop, err := start(url, &service{
+		admin: admin, kube: kube, kubeAPI: "https://kubernetes.default.svc", kubeToken: saDir + "token", replicas: 3,
+		m: m, sysAcct: sysAcct, authAcct: authAcct,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
