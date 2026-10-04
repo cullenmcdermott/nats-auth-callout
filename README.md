@@ -141,6 +141,22 @@ nats --server wss://nats.cullen.rocks --token "$TOKEN" server list
 Requires the `nats-admins` group. You land in the SYS account and the session expires with the
 token. The token is only valid for NATS (`aud=nats`), not for anything else Pocket ID protects.
 
+## Observability
+
+Logs are JSON on stderr, one `auth` line per decision:
+
+```json
+{"level":"WARN","msg":"auth","kind":"workload","who":"system:serviceaccount:app:default","result":"deny","ms":4,"ip":"10.244.1.7","client":"","server":"nats-1","err":"denied: give the workload its own ServiceAccount"}
+```
+
+`result` is `allow`, `deny` (bad credential: client's problem) or `error` (TokenReview, KV or
+account push failed: ours). Account creation and pushes are logged too. Port 8080 serves:
+
+| Path | |
+|---|---|
+| `/healthz` | 503 while either NATS connection is down (liveness probe) |
+| `/metrics` | `nats_auth_callout_decisions_total{kind,result}`, `nats_auth_callout_duration_seconds{kind}`, `nats_auth_callout_accounts_created_total`, `nats_auth_callout_errors_total` (requests never answered), `nats_auth_callout_up`, plus Go runtime |
+
 ## Known ceilings
 
 - `NATS_AUTH_MASTER` can sign for any account until it is rotated. Rotation is a short outage,

@@ -18,6 +18,7 @@ import (
 	"github.com/go-jose/go-jose/v4"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 var operatorSecret = keys("test-operator-secret-at-least-32-bytes")
@@ -205,6 +206,16 @@ func TestEndToEnd(t *testing.T) {
 		if nc, err := dial(tok); err == nil {
 			nc.Close()
 			t.Errorf("%s: connected, want rejection", name)
+		}
+	}
+
+	// Rejected credentials count as deny; error is reserved for our own failures.
+	for labels, want := range map[[2]string]bool{
+		{"workload", "allow"}: true, {"workload", "deny"}: true, {"admin", "allow"}: true, {"admin", "deny"}: true,
+		{"workload", "error"}: false, {"admin", "error"}: false,
+	} {
+		if got := testutil.ToFloat64(decisions.WithLabelValues(labels[:]...)) > 0; got != want {
+			t.Errorf("decisions%v counted = %v, want %v", labels, got, want)
 		}
 	}
 
