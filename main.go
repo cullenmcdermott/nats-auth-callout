@@ -5,6 +5,7 @@
 // Pocket ID tokens carrying the nats-admins group are placed in the system account.
 //
 //	nats-auth-callout init   print the server config and callout env (JSON)
+//	nats-auth-callout migrate <namespace/serviceaccount> <account> <uid>   bind a legacy mapping
 //	nats-auth-callout        run the callout service
 package main
 
@@ -40,7 +41,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/synadia-io/callout.go"
 )
 
 const (
@@ -50,7 +50,7 @@ const (
 	audience    = "nats"
 	saDir       = "/var/run/secrets/kubernetes.io/serviceaccount/"
 	budget      = 1500 * time.Millisecond // per-request, under the server's 2s auth timeout
-	bucket      = "accounts"              // KV in the AUTH account: namespace/serviceaccount -> account public key
+	bucket      = "accounts"              // KV in AUTH: namespace/serviceaccount -> {account, uid}
 	httpAddr    = ":8080"                 // /metrics and /healthz
 )
 
@@ -73,7 +73,7 @@ var (
 	})
 	failures = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "nats_auth_callout_errors_total",
-		Help: "Requests the callout could not answer (bad request, full worker queue, failed reply). The client times out.",
+		Help: "Malformed requests, admission rejections, and failed replies.",
 	})
 )
 
@@ -179,6 +179,7 @@ func serverConfig(o, m keys) (map[string]any, error) {
 		"system_account":   pub(o.sys()),
 		"resolver_preload": map[string]string{pub(o.sys()): sysJWT, pub(o.auth()): authJWT},
 		"default_sentinel": sentinel,
+		"tls":              map[string]any{"cert_file": "/etc/nats-certs/nats/tls.crt", "key_file": "/etc/nats-certs/nats/tls.key", "min_version": "1.2"},
 	}, nil
 }
 
@@ -199,9 +200,9 @@ type service struct {
 }
 
 // authorize decides a request and records it: one log line and the metrics.
-func (s *service) authorize(req *jwt.AuthorizationRequest) (string, error) {
+func (s *service) authorize(ctx context.Context, req *jwt.AuthorizationRequest) (string, error) {
 	start := time.Now()
-	kind, who, user, err := s.decide(req)
+	kind, who, user, err := s.decide(ctx, req)
 	result := "allow"
 	if errors.Is(err, errDenied) {
 		result = "deny"
@@ -221,13 +222,16 @@ func (s *service) authorize(req *jwt.AuthorizationRequest) (string, error) {
 	return user, err
 }
 
-func (s *service) decide(req *jwt.AuthorizationRequest) (kind, who, user string, err error) {
+func (s *service) decide(ctx context.Context, req *jwt.AuthorizationRequest) (kind, who, user string, err error) {
+	if req.TLS == nil || (req.TLS.Version != "1.2" && req.TLS.Version != "1.3") {
+		return "none", "", "", fmt.Errorf("%w: TLS 1.2 or newer is required", errDenied)
+	}
 	tok := req.ConnectOptions.Token
 	if tok == "" {
 		return "none", "", "", fmt.Errorf("%w: no token", errDenied)
 	}
 	// The server gives up on auth after 2s; stay under it so we never answer a dead request.
-	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	ctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	iss, exp := peek(tok)
 	if iss == adminIssuer {
@@ -280,7 +284,7 @@ func (s *service) authorizeAdmin(ctx context.Context, userNkey, tok string) (who
 }
 
 func (s *service) authorizeWorkload(ctx context.Context, userNkey, tok string, exp int64) (who, user string, err error) {
-	who, pod, groups, err := s.tokenReview(ctx, tok)
+	who, uid, pod, groups, err := s.tokenReview(ctx, tok)
 	if err != nil {
 		return "", "", err
 	}
@@ -301,7 +305,7 @@ func (s *service) authorizeWorkload(ctx context.Context, userNkey, tok string, e
 	if pod != "" {
 		who += " pod " + pod
 	}
-	acct, err := s.account(ctx, parts[2]+"/"+parts[3])
+	acct, err := s.account(ctx, parts[2]+"/"+parts[3], uid)
 	if err != nil {
 		return who, "", err
 	}
@@ -315,10 +319,10 @@ func (s *service) authorizeWorkload(ctx context.Context, userNkey, tok string, e
 
 // tokenReview asks the API server to validate a projected token. Unlike local JWKS checks this
 // rejects tokens of deleted pods, and sidesteps the cluster's unreachable issuer URL.
-func (s *service) tokenReview(ctx context.Context, tok string) (user, pod string, groups []string, err error) {
+func (s *service) tokenReview(ctx context.Context, tok string) (user, uid, pod string, groups []string, err error) {
 	self, err := os.ReadFile(s.kubeToken)
 	if err != nil {
-		return "", "", nil, err
+		return "", "", "", nil, err
 	}
 	body, _ := json.Marshal(map[string]any{
 		"apiVersion": "authentication.k8s.io/v1",
@@ -327,45 +331,58 @@ func (s *service) tokenReview(ctx context.Context, tok string) (user, pod string
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.kubeAPI+"/apis/authentication.k8s.io/v1/tokenreviews", bytes.NewReader(body))
 	if err != nil {
-		return "", "", nil, err
+		return "", "", "", nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(self)))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := s.kube.Do(req)
 	if err != nil {
-		return "", "", nil, err
+		return "", "", "", nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		return "", "", nil, fmt.Errorf("tokenreview: %s", resp.Status)
+		return "", "", "", nil, fmt.Errorf("tokenreview: %s", resp.Status)
 	}
 	var out struct {
 		Status struct {
 			Authenticated bool
+			Audiences     []string
 			Error         string
 			User          struct {
 				Username string
+				UID      string
 				Groups   []string
 				Extra    map[string][]string
 			}
 		}
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", "", nil, err
+		return "", "", "", nil, err
 	}
 	if !out.Status.Authenticated {
-		return "", "", nil, fmt.Errorf("%w: tokenreview: %s", errDenied, out.Status.Error)
+		return "", "", "", nil, fmt.Errorf("%w: tokenreview: %s", errDenied, out.Status.Error)
+	}
+	if !slices.Contains(out.Status.Audiences, audience) || out.Status.User.UID == "" {
+		return "", "", "", nil, fmt.Errorf("%w: tokenreview: nats audience and ServiceAccount UID are required", errDenied)
 	}
 	if p := out.Status.User.Extra["authentication.kubernetes.io/pod-name"]; len(p) > 0 {
 		pod = p[0]
 	}
-	return out.Status.User.Username, pod, out.Status.User.Groups, nil
+	return out.Status.User.Username, out.Status.User.UID, pod, out.Status.User.Groups, nil
 }
 
 // account returns the account for name, creating it on first use. Its identity key is random and
 // discarded at once: only the public key is kept, in a KV bucket on the same JetStream storage as
 // the data it owns, so the two are lost together or not at all.
-func (s *service) account(ctx context.Context, name string) (string, error) {
+type accountRecord struct {
+	Account string `json:"account"`
+	UID     string `json:"uid"`
+}
+
+func (s *service) account(ctx context.Context, name, uid string) (string, error) {
+	if uid == "" {
+		return "", fmt.Errorf("%w: missing ServiceAccount UID", errDenied)
+	}
 	e, err := s.kv.Get(ctx, name)
 	if errors.Is(err, jetstream.ErrKeyNotFound) {
 		kp, err := nkeys.CreateAccount()
@@ -373,7 +390,11 @@ func (s *service) account(ctx context.Context, name string) (string, error) {
 			return "", err
 		}
 		acct := pub(kp)
-		if _, err = s.kv.Create(ctx, name, []byte(acct)); err == nil {
+		record, err := json.Marshal(accountRecord{Account: acct, UID: uid})
+		if err != nil {
+			return "", err
+		}
+		if _, err = s.kv.Create(ctx, name, record); err == nil {
 			created.Inc()
 			slog.Info("account created", "name", name, "account", acct)
 			return acct, s.push(ctx, name, acct)
@@ -385,8 +406,17 @@ func (s *service) account(ctx context.Context, name string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("account %s: %w", name, err)
 	}
-	acct := string(e.Value())
-	return acct, s.push(ctx, name, acct)
+	var record accountRecord
+	if err := json.Unmarshal(e.Value(), &record); err != nil || record.UID == "" {
+		return "", fmt.Errorf("%w: account %s requires explicit UID migration", errDenied, name)
+	}
+	if record.UID != uid {
+		return "", fmt.Errorf("%w: account %s belongs to another ServiceAccount UID", errDenied, name)
+	}
+	if !nkeys.IsValidPublicAccountKey(record.Account) {
+		return "", fmt.Errorf("invalid stored account key for %s", name)
+	}
+	return record.Account, s.push(ctx, name, record.Account)
 }
 
 // push sends the account JWT, signed with the current keys, to the resolver once per process.
@@ -435,15 +465,21 @@ func (s *service) push(ctx context.Context, name, acct string) error {
 // healthy reports whether both NATS connections are up. While either is reconnecting, logins fail.
 func (s *service) healthy() bool { return s.sys.IsConnected() && s.nc.IsConnected() }
 
-// logger quiets callout.go's own logging: decisions are logged by authorize, errors by ErrCallback.
-type logger struct{}
-
-func (logger) Noticef(f string, a ...any) { slog.Info(fmt.Sprintf(f, a...)) }
-func (logger) Warnf(f string, a ...any)   { slog.Warn(fmt.Sprintf(f, a...)) }
-func (logger) Fatalf(f string, a ...any)  { slog.Error(fmt.Sprintf(f, a...)); os.Exit(1) }
-func (logger) Errorf(string, ...any)      {}
-func (logger) Debugf(string, ...any)      {}
-func (logger) Tracef(string, ...any)      {}
+// natsTLS requires certificate verification even when NATS_URL uses the nats:// scheme.
+func natsTLS() (*tls.Config, error) {
+	cfg := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: os.Getenv("NATS_TLS_SERVER_NAME")}
+	if path := os.Getenv("NATS_TLS_CA"); path != "" {
+		ca, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		cfg.RootCAs = x509.NewCertPool()
+		if !cfg.RootCAs.AppendCertsFromPEM(ca) {
+			return nil, fmt.Errorf("NATS_TLS_CA contains no certificates")
+		}
+	}
+	return cfg, nil
+}
 
 // connect logs in as a user minted on the fly with an account signing key.
 func connect(url, name, acct string, signer, user nkeys.KeyPair) (*nats.Conn, error) {
@@ -454,7 +490,11 @@ func connect(url, name, acct string, signer, user nkeys.KeyPair) (*nats.Conn, er
 	if err != nil {
 		return nil, err
 	}
-	return nats.Connect(url, nats.Name(name), nats.MaxReconnects(-1),
+	tlsConfig, err := natsTLS()
+	if err != nil {
+		return nil, err
+	}
+	return nats.Connect(url, nats.Secure(tlsConfig), nats.Name(name), nats.MaxReconnects(-1),
 		nats.UserJWT(func() (string, error) { return token, nil }, user.Sign))
 }
 
@@ -483,25 +523,12 @@ func start(url string, s *service) (func(), error) {
 		return nil, fmt.Errorf("accounts bucket: %w", err)
 	}
 	s.sys, s.nc, s.pushed = sys, nc, map[string]bool{}
-	svc, err := callout.NewAuthorizationService(nc,
-		callout.Authorizer(s.authorize),
-		callout.AsyncWorkers(8), // else one slow request stalls every login; a full queue drops (fails closed)
-		callout.ResponseSignerKey(s.m.authSigner()),
-		callout.ResponseSignerIssuer(s.authAcct),
-		callout.EncryptionKey(s.m.xkey()),
-		callout.Logger(logger{}),
-		callout.ErrCallback(func(err error) {
-			if !errors.Is(err, callout.ErrRejectedAuth) { // rejections were logged by authorize
-				failures.Inc()
-				slog.Error("callout", "err", err.Error())
-			}
-		}),
-	)
+	stopAuth, err := startAuthorization(nc, s)
 	if err != nil {
 		stop()
 		return nil, err
 	}
-	return func() { _ = svc.Stop(); stop() }, nil
+	return func() { stopAuth(); stop() }, nil
 }
 
 // diskLimits parses NATS_ACCOUNT_DISK: "namespace/serviceaccount=bytes", comma-separated.
@@ -552,6 +579,36 @@ func main() {
 		log.Fatal("NATS_SYS_ACCOUNT and NATS_AUTH_ACCOUNT are required (from `init`)")
 	}
 
+	url := os.Getenv("NATS_URL")
+	if url == "" {
+		url = "tls://nats.nats:4222"
+	}
+	if len(os.Args) > 1 && os.Args[1] == "migrate" {
+		if len(os.Args) != 5 {
+			log.Fatal("usage: nats-auth-callout migrate namespace/serviceaccount expected-account-public-key verified-serviceaccount-uid")
+		}
+		nc, err := connect(url, "nats-auth-callout-migrate", authAcct, m.authSigner(), m.user("callout"))
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer nc.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		js, err := jetstream.New(nc)
+		if err != nil {
+			log.Fatal(err)
+		}
+		kv, err := js.KeyValue(ctx, bucket)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err = migrateAccount(ctx, kv, os.Args[2], os.Args[3], os.Args[4]); err != nil {
+			log.Fatal(err)
+		}
+		slog.Info("account UID migration complete", "name", os.Args[2], "uid", os.Args[4])
+		return
+	}
+
 	ca, err := os.ReadFile(saDir + "ca.crt")
 	if err != nil {
 		log.Fatal(err)
@@ -569,10 +626,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	url := os.Getenv("NATS_URL")
-	if url == "" {
-		url = "nats://nats.nats:4222"
-	}
 	s := &service{
 		admin: admin, kube: kube, kubeAPI: "https://kubernetes.default.svc", kubeToken: saDir + "token", replicas: 3, disk: disk,
 		m: m, sysAcct: sysAcct, authAcct: authAcct,

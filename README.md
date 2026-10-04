@@ -2,7 +2,7 @@
 
 NATS auth callout for the homelab cluster. Pods authenticate with a projected
 ServiceAccount token; admins authenticate with a Pocket ID token. Keys are derived from two
-secrets, and the only state is a KV bucket mapping each ServiceAccount to its account.
+secrets, and the only state is a KV bucket mapping each ServiceAccount to its account and verified Kubernetes UID.
 
 ```mermaid
 sequenceDiagram
@@ -20,7 +20,7 @@ sequenceDiagram
     else projected SA token (aud=nats)
         A->>K: TokenReview
         K-->>A: system:serviceaccount:<ns>:<sa>
-        A->>N: KV accounts: look up or create <ns>/<sa>
+        A->>N: KV accounts: check UID, look up or create <ns>/<sa>
         A->>N: $SYS.REQ.CLAIMS.UPDATE (account JWT, once per process)
         A-->>N: user JWT in account <ns>/<sa>
     end
@@ -28,8 +28,8 @@ sequenceDiagram
 ```
 
 - Each `namespace/serviceaccount` gets its own NATS account, created on first connect and
-  pushed to the server's full resolver. The `default` ServiceAccount is rejected.
-- An account's identity key is random and discarded at once. Its public key is kept in the
+  pushed to the server's full resolver. The `default` ServiceAccount is rejected. TokenReview must return the `nats` audience and a nonempty UID. A recreated ServiceAccount with a different UID is denied access to the old account.
+- An account's identity key is random and discarded at once. Its public key and owning ServiceAccount UID are kept in the
   `accounts` KV bucket in the AUTH account, on the same JetStream storage as the data it owns.
   If NATS data is lost, both go together and workloads get fresh, empty accounts.
 
@@ -68,7 +68,39 @@ NATS_AUTH_MASTER="$(op read op://k8s-secrets/nats-auth-callout/password)" \
    `nats-admins` group with your user in it.
 
 The service reads `NATS_AUTH_MASTER`, `NATS_SYS_ACCOUNT`, `NATS_AUTH_ACCOUNT` (all required) and
-`NATS_URL` (default `nats://nats.nats:4222`).
+`NATS_URL` (default `tls://nats.nats:4222`). TLS 1.2 or newer and server certificate verification are required, including when the URL uses `nats://`.
+
+Set `NATS_TLS_CA` to a mounted PEM CA file for private certificates; otherwise the system trust store is used. Set `NATS_TLS_SERVER_NAME` when the certificate DNS name differs from the connection hostname, for example `nats.cullen.rocks` when connecting through `nats.nats`. Invalid CA files fail startup. Client authorization also requires a TLS 1.2 or newer connection to the NATS server.
+
+### TLS deployment
+
+The generated config expects `tls.crt` and `tls.key` at `/etc/nats-certs/nats/`. Mount the certificate before enabling this config. With the NATS Helm chart, enable `config.nats.tls` using your certificate Secret and require `min_version: "1.2"`.
+
+Websocket TLS needs its own configuration: enable `config.websocket.tls`, then configure Traefik to use HTTPS to the backend and verify its certificate. For a certificate for `nats.cullen.rocks`, use a `ServersTransport` with `serverName: nats.cullen.rocks` and `insecureSkipVerify: false`. Keep the public ingress on WSS. Enabling TLS only at Traefik leaves the internal leg exposed. See [NATS TLS documentation](https://docs.nats.io/learn/security/encryption) and [Traefik backend annotations](https://doc.traefik.io/traefik/reference/routing-configuration/kubernetes/ingress/).
+
+### Migrating existing account mappings
+
+This version requires a coordinated maintenance rollout. Build and pin the new image before applying the TLS changes: the old image does not implement `NATS_TLS_SERVER_NAME`. Update workload clients to verify the configured certificate identity too.
+
+Back up the `accounts` KV bucket and confirm access to `NATS_AUTH_MASTER` and the public account settings. A SYS login cannot access AUTH's KV bucket. The new binary's `migrate` command uses the existing callout identity to establish a verified TLS maintenance connection without printing credentials; it requires no Kubernetes API access.
+
+For each mapping, verify which workload owns its data and obtain the intended ServiceAccount UID (`kubectl get serviceaccount NAME -n NAMESPACE -o jsonpath='{.metadata.uid}'`). Stop all old callout replicas before changing KV values: old readers cannot read the new format. Keep NATS and its storage running.
+
+With the new binary, the existing callout environment, and TLS enabled and verified, run:
+
+```bash
+nats-auth-callout migrate NAMESPACE/SERVICEACCOUNT EXISTING_ACCOUNT_PUBLIC_KEY VERIFIED_SERVICEACCOUNT_UID
+```
+
+The command requires the existing value to match the supplied account public key and performs a revision-checked update to:
+
+```json
+{"account":"<existing account public key>","uid":"<verified ServiceAccount UID>"}
+```
+
+The account key and JetStream data are preserved. It never creates a missing mapping or rebinds an account to a different UID; repeating an identical migration is safe. If a name has been recreated or ownership is uncertain, halt migration for that entry and leave it denied. Explicitly provision a fresh account only after resolving ownership; never bind old data to an unverified replacement UID.
+
+Start only upgraded callout replicas after migration. Verify login, account isolation, and existing stream data before cleanup. For rollback to the old binary, stop new readers and restore the backed-up raw-key mappings before starting old readers. If verified ownership, maintenance credentials, or a new image digest are unavailable, stop the rollout.
 
 ### Rotating `NATS_AUTH_MASTER`
 
@@ -121,7 +153,9 @@ The connection is dropped when the token expires. Re-read the file on every (re)
 client reconnects transparently with the rotated token:
 
 ```go
-nc, err := nats.Connect("nats://nats.nats:4222",
+// Uses the system CA pool and verifies the public certificate identity.
+nc, err := nats.Connect("tls://nats.nats:4222",
+    nats.Secure(&tls.Config{MinVersion: tls.VersionTLS12, ServerName: "nats.cullen.rocks"}),
     nats.MaxReconnects(-1),
     nats.TokenHandler(func() string {
         b, _ := os.ReadFile("/var/run/secrets/nats/token")
@@ -155,7 +189,7 @@ account push failed: ours). Account creation and pushes are logged too. Port 808
 | Path | |
 |---|---|
 | `/healthz` | 503 while either NATS connection is down (liveness probe) |
-| `/metrics` | `nats_auth_callout_decisions_total{kind,result}`, `nats_auth_callout_duration_seconds{kind}`, `nats_auth_callout_accounts_created_total`, `nats_auth_callout_errors_total` (requests never answered), `nats_auth_callout_up`, plus Go runtime |
+| `/metrics` | `nats_auth_callout_decisions_total{kind,result}`, `nats_auth_callout_duration_seconds{kind}`, `nats_auth_callout_accounts_created_total`, `nats_auth_callout_errors_total` (malformed requests, admission rejections, failed replies), `nats_auth_callout_up`, plus Go runtime |
 
 ## Known ceilings
 
@@ -163,10 +197,12 @@ account push failed: ours). Account creation and pushes are logged too. Port 808
   not a seamless handover (the operator lists only one signing key at a time).
 - Losing `NATS_OPERATOR_SECRET` means rebuilding the trust root, which orphans all JetStream data.
 - A deleted pod stays connected until its token expires (at most `expirationSeconds`).
-- The admin token crosses the in-cluster websocket leg in plaintext after Traefik terminates TLS.
 - Cross-account sharing (exports/imports) is not implemented.
-- No rate limit on JWKS refetches for unknown `kid`s; bounded only by the 8 workers and the 1.5s
-  per-request budget.
+- Authentication has eight concurrent slots and no worker waiting queue. Each source IP gets
+  five attempts per second with a burst of ten; at most 4096 IPs are tracked. Signed request
+  expiry and the 1.5s budget bound upstream work. Overload is denied promptly. Clients sharing
+  a proxy or NAT share its budget; distributed floods still require edge rate limits.
+- Unknown `kid`s can still cause JWKS refetches within those admission limits.
 - Accounts are never garbage-collected, and any ServiceAccount in any namespace gets one (no
   namespace allowlist; fine for a single-owner cluster).
 - The JetStream per-account disk limit is soft in clustered mode.
