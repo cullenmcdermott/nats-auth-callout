@@ -1,0 +1,11 @@
+schema-version = "1.13.0"
+
+[install]
+go_1_27.pkg-path = "go_1_27"
+ko.pkg-path = "ko"
+ko.pkg-group = "tools"
+natscli.pkg-path = "natscli"
+natscli.pkg-group = "tools"
+
+[options]
+systems = ["aarch64-darwin", "aarch64-linux", "x86_64-linux"]
