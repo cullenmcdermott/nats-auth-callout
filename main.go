@@ -10,6 +10,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -24,6 +25,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -156,8 +158,9 @@ type service struct {
 	admin     *oidc.IDTokenVerifier
 	kube      *http.Client
 	kubeAPI   string
-	kubeToken string // path to our own SA token, re-read per request since kubelet rotates it
-	replicas  int    // of the accounts bucket
+	kubeToken string           // path to our own SA token, re-read per request since kubelet rotates it
+	replicas  int              // of the accounts bucket
+	disk      map[string]int64 // JetStream disk bytes by account name (namespace/serviceaccount), overriding the 1 GiB default
 
 	m                 keys
 	sysAcct, authAcct string
@@ -342,7 +345,7 @@ func (s *service) push(ctx context.Context, name, acct string) error {
 	ac.Limits.Subs = 1000
 	ac.Limits.Payload = 1 << 20
 	ac.Limits.LeafNodeConn = 0
-	ac.Limits.JetStreamLimits = jwt.JetStreamLimits{DiskStorage: 1 << 30, Streams: 10, Consumer: 100}
+	ac.Limits.JetStreamLimits = jwt.JetStreamLimits{DiskStorage: cmp.Or(s.disk[name], 1<<30), Streams: 10, Consumer: 100}
 	token, err := ac.Encode(s.m.operatorSigner())
 	if err != nil {
 		return err
@@ -420,6 +423,23 @@ func start(url string, s *service) (func(), error) {
 	return func() { _ = svc.Stop(); stop() }, nil
 }
 
+// diskLimits parses NATS_ACCOUNT_DISK: "namespace/serviceaccount=bytes", comma-separated.
+func diskLimits(v string) (map[string]int64, error) {
+	m := map[string]int64{}
+	for _, kv := range strings.Split(v, ",") {
+		if kv = strings.TrimSpace(kv); kv == "" {
+			continue
+		}
+		name, n, ok := strings.Cut(kv, "=")
+		b, err := strconv.ParseInt(n, 10, 64)
+		if !ok || err != nil || b <= 0 || !strings.Contains(name, "/") {
+			return nil, fmt.Errorf("NATS_ACCOUNT_DISK: bad entry %q, want namespace/serviceaccount=bytes", kv)
+		}
+		m[name] = b
+	}
+	return m, nil
+}
+
 func secret(name string) keys {
 	v := os.Getenv(name)
 	if len(v) < 32 {
@@ -462,12 +482,17 @@ func main() {
 	// Remote key set rather than discovery, so Pocket ID being down only blocks admin logins, not startup.
 	admin := oidc.NewVerifier(adminIssuer, oidc.NewRemoteKeySet(ctx, adminIssuer+"/.well-known/jwks.json"), &oidc.Config{ClientID: adminClient})
 
+	disk, err := diskLimits(os.Getenv("NATS_ACCOUNT_DISK"))
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	url := os.Getenv("NATS_URL")
 	if url == "" {
 		url = "nats://nats.nats:4222"
 	}
 	stop, err := start(url, &service{
-		admin: admin, kube: kube, kubeAPI: "https://kubernetes.default.svc", kubeToken: saDir + "token", replicas: 3,
+		admin: admin, kube: kube, kubeAPI: "https://kubernetes.default.svc", kubeToken: saDir + "token", replicas: 3, disk: disk,
 		m: m, sysAcct: sysAcct, authAcct: authAcct,
 	})
 	if err != nil {

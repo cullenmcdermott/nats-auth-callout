@@ -44,6 +44,8 @@ Users are signed with account signing keys and accounts with the operator signin
 `NATS_AUTH_MASTER` re-signs everything but changes no identity: JetStream data is kept.
 - Per-account caps: 50 connections, 1000 subscriptions, 1 MiB payload, no leafnodes,
   JetStream 1 GiB disk / 10 streams / 100 consumers. NATS has no msgs/sec throttle; these are caps.
+  Raise the disk cap per account with `NATS_ACCOUNT_DISK=namespace/serviceaccount=bytes,...`;
+  it counts every replica, so an R3 stream of N bytes needs 3N.
 
 ## Bootstrap
 
