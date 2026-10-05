@@ -147,7 +147,7 @@ func bootServer(t *testing.T, dir string, master keys, kube *httptest.Server, ad
 	tokenFile := filepath.Join(dir, "token")
 	_ = os.WriteFile(tokenFile, []byte("callout-sa-token\n"), 0o600)
 	stop, err := start(ns.ClientURL(), &service{
-		admin: admin, kube: kube.Client(), kubeAPI: kube.URL, kubeToken: tokenFile, replicas: 1, disk: map[string]int64{"app/worker": 2 << 30},
+		admin: admin, kube: kube.Client(), kubeAPI: kube.URL, kubeToken: tokenFile, replicas: 1, disk: map[string]int64{"app/worker": 2 << 30}, mem: map[string]int64{"app/worker": 48 << 20},
 		m: master, sysAcct: pub(operatorSecret.sys()), authAcct: pub(operatorSecret.auth()),
 	})
 	if err != nil {
@@ -215,15 +215,21 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("jetstream: %v", err)
 	}
 
-	// NATS_ACCOUNT_DISK overrides the default JetStream disk cap per account.
+	// Account byte limits override the defaults only for listed accounts.
 	for nc, want := range map[*nats.Conn]int64{a1: 2 << 30, other: 1 << 30} {
 		js, _ := nc.JetStream()
 		if ai, err := js.AccountInfo(); err != nil || ai.Limits.MaxStore != want {
 			t.Errorf("max store = %v (err %v), want %d", ai, err, want)
 		}
 	}
-	if _, err := diskLimits("app/worker=1,bad"); err == nil {
-		t.Error("diskLimits accepted a bad entry")
+	for nc, want := range map[*nats.Conn]int64{a1: 48 << 20, other: 0} {
+		js, _ := nc.JetStream()
+		if ai, err := js.AccountInfo(); err != nil || ai.Limits.MaxMemory != want {
+			t.Errorf("max memory = %v (err %v), want %d", ai, err, want)
+		}
+	}
+	if _, err := byteLimits("NATS_ACCOUNT_MEMORY", "app/worker=1,bad"); err == nil || !strings.Contains(err.Error(), "NATS_ACCOUNT_MEMORY") {
+		t.Errorf("byteLimits bad entry error = %v, want NATS_ACCOUNT_MEMORY", err)
 	}
 
 	// Admin lands in SYS and can reach server internals.
